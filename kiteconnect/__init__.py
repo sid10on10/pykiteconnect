@@ -86,15 +86,17 @@ by looking at HTTP codes or JSON error responses. Instead,
 it raises aptly named **[exceptions](exceptions.m.html)** that you can catch.
 """
 from six import StringIO
-import ssl
+import sys
 import csv
 import json
 import struct
 import hashlib
 import requests
-import threading
 
-import websocket
+from twisted.python import log
+from twisted.internet import reactor, ssl
+from twisted.internet.protocol import ReconnectingClientFactory
+from autobahn.twisted.websocket import WebSocketClientProtocol, WebSocketClientFactory
 
 import kiteconnect.exceptions as ex
 
@@ -534,6 +536,63 @@ class KiteConnect(object):
 			raise ex.DataException("Unknown Content-Type (%s) in response: (%s)" % (r.headers["content-type"], r.content))
 
 
+class WebSocketProtocol(WebSocketClientProtocol):
+	def __init__(self, *args, **kwargs):
+		super(WebSocketProtocol, self).__init__(*args, **kwargs)
+
+	def onConnect(self, response):
+		self.factory.ws = self
+		self.send = self.sendMessage
+
+		if self.factory.on_connect:
+			self.factory.on_connect(self, response)
+
+		self.factory.resetDelay()
+
+	def onOpen(self):
+		if self.factory.on_open:
+			self.factory.on_open(self)
+
+	def onMessage(self, payload, isBinary):
+		if self.factory.on_message:
+			self.factory.on_message(self, payload, isBinary)
+
+	def onClose(self, wasClean, code, reason):
+		if not wasClean:
+			if self.factory.on_error:
+				self.factory.on_error(self, code, reason)
+
+		if self.factory.on_close:
+			self.factory.on_close(self, code, reason)
+
+	def close(self, code=None, reason=None):
+		return self.sendClose(code, reason)
+
+	def isConnected(self):
+		if self.STATE_OPEN:
+			return True
+		return False
+
+
+class WebSocketFactory(WebSocketClientFactory, ReconnectingClientFactory):
+	protocol = WebSocketProtocol
+
+	def __init__(self, *args, **kwargs):
+		self.ws = None
+		self.on_connect = None
+		self.on_open = None
+		self.on_error = None
+		self.on_close = None
+		self.on_message = None
+		super(WebSocketFactory, self).__init__(*args, **kwargs)
+
+	def clientConnectionFailed(self, connector, reason):
+		self.retry(connector)
+
+	def clientConnectionLost(self, connector, reason):
+		self.retry(connector)
+
+
 class WebSocket(object):
 	"""
 	The WebSocket client for connecting to Kite Connect's streaming quotes service.
@@ -665,9 +724,11 @@ class WebSocket(object):
 
 	# Default root API endpoint. It's possible to
 	# override this by passing the `root` parameter during initialisation.
-	_root = "wss://websocket.kite.trade/"
+	_scheme = "wss"
+	_host = "websocket.kite.trade"
+	_port = 443
 
-	def __init__(self, api_key, public_token, user_id, root=None):
+	def __init__(self, api_key, public_token, user_id, scheme=None, host=None, port=None, debug=False):
 		"""
 		Initialise websocket client instance.
 
@@ -682,15 +743,20 @@ class WebSocket(object):
 			want to send API requests to a non-default endpoint, this
 			can be ignored.
 		"""
-		self.socket_url = "{root}" \
+		self.scheme = scheme if scheme else self._scheme
+		self.port = port if port else self._port
+		self.host = host if host else self._host
+
+		self.socket_url = "{scheme}://{host}" \
 			"?api_key={api_key}&user_id={user_id}&public_token={public_token}".format(
-				root=root if root else self._root,
+				scheme=self.scheme,
+				host=self.host,
 				api_key=api_key,
 				public_token=public_token,
 				user_id=user_id
 			)
-		self.socket = self._create_connection()
 
+		self.debug = debug
 		# Placeholders for callbacks.
 		self.on_tick = None
 		self.on_message = None
@@ -701,53 +767,38 @@ class WebSocket(object):
 		self.subscribed_tokens = set()
 		self.modes = set()
 
-	def _create_connection(self):
+		# Create connection on initialization
+		self._create_connection(self.socket_url)
+
+	def _create_connection(self, socket_url):
 		"""Create a WebSocket client connection."""
-		return websocket.WebSocketApp(self.socket_url,
-								on_open=self._on_connect,
-								on_message=self._on_message,
-								on_data=self._on_data,
-								on_error=self._on_error,
-								on_close=self._on_close)
+		self.factory = WebSocketFactory(socket_url)
+		self.ws = self.factory.ws
+		self.factory.on_connect = self._on_connect
+		self.factory.on_open = self._on_open
+		self.factory.on_error = self._on_error
+		self.factory.on_close = self._on_close
+		self.factory.on_message = self._on_message
 
-	def connect(self, threaded=False, disable_ssl_verification=False):
+	def connect(self):
 		"""
-		Start a WebSocket connection as a seperate thread.
-
-		- `threaded` when set to True will open the connection
-			in a new thread without blocking the main thread
-		- `disable_ssl_verification` when set to True will disable ssl cert verifcation. Default is False.
+		Connect to websocket
 		"""
-		sslopt = {}
-		if disable_ssl_verification:
-			sslopt = {"cert_reqs": ssl.CERT_NONE}
+		if self.debug:
+			log.startLogging(sys.stdout)
 
-		if not threaded:
-			self.socket.run_forever(sslopt=sslopt)
-		else:
-			self.websocket_thread = threading.Thread(target=self.socket.run_forever, kwargs={"sslopt": sslopt})
-			self.websocket_thread.daemon = True
-			self.websocket_thread.start()
-
-		return self
+		reactor.connectSSL(self.host, 443, self.factory, ssl.ClientContextFactory())
+		reactor.run()
 
 	def is_connected(self):
 		"""Check if WebSocket connection is established."""
-		if self.socket and self.socket.sock:
-			return self.socket.sock.connected
-		else:
-			return False
-
-	def reconnect(self):
-		"""Reconnect WebSocket connection if it is not connected."""
-		if not self.is_connected():
-			self.socket = self._create_connection()
-
-		return True
+		if self.ws:
+			return self.ws.isConnected()
 
 	def close(self):
 		"""Close the WebSocket connection."""
-		self.socket.close()
+		if self.ws:
+			self.ws.close()
 
 	def subscribe(self, instrument_tokens):
 		"""
@@ -756,14 +807,14 @@ class WebSocket(object):
 		- `instrument_tokens` is list of instrument instrument_tokens to subscribe
 		"""
 		try:
-			self.socket.send(json.dumps({"a": self._message_subscribe, "v": instrument_tokens}))
+			self.ws.send(json.dumps({"a": self._message_subscribe, "v": instrument_tokens}))
 
 			for token in instrument_tokens:
 				self.subscribed_tokens.add(token)
 
 			return True
 		except:
-			self.socket.close()
+			self.close()
 			raise
 
 	def unsubscribe(self, instrument_tokens):
@@ -773,7 +824,7 @@ class WebSocket(object):
 		- `instrument_tokens` is list of instrument_tokens to unsubscribe.
 		"""
 		try:
-			self.socket.send(json.dumps({"a": self._message_unsubscribe, "v": instrument_tokens}))
+			self.ws.send(json.dumps({"a": self._message_unsubscribe, "v": instrument_tokens}))
 
 			for token in instrument_tokens:
 				try:
@@ -783,7 +834,8 @@ class WebSocket(object):
 
 			return True
 		except:
-			self.socket.close()
+			self.close()
+			raise
 
 	def set_mode(self, mode, instrument_tokens):
 		"""
@@ -794,39 +846,42 @@ class WebSocket(object):
 		- `instrument_tokens` is list of instrument tokens on which the mode should be applied
 		"""
 		try:
-			self.socket.send(json.dumps({"a": self._message_setmode, "v": [mode, instrument_tokens]}))
+			self.ws.send(json.dumps({"a": self._message_setmode, "v": [mode, instrument_tokens]}))
 			return True
 		except:
-			self.socket.close()
+			self.close()
 			raise
 
-	def _on_connect(self, ws):
+	def _on_connect(self, ws, response):
+		self.ws = ws
 		if self.on_connect:
-			self.on_connect(self)
+			self.on_connect(self, response)
 
-	def _on_data(self, ws, data, resp_type, data_continue):
-		"""Receive raw data from websocket."""
-		if self.on_tick:
-			# If the message is binary, parse it and send it to the callback.
-			if resp_type != 1 and len(data) > 4:
-				self.on_tick(self._parse_binary(data), self)
-
-	def _on_close(self, ws):
+	def _on_close(self, ws, code, reason):
 		"""Call 'on_close' callback when connection is closed."""
 		if self.on_close:
-			self.on_close(self)
+			self.on_close(self, code, reason)
 
-	def _on_error(self, ws, error):
+	def _on_error(self, ws, code, reason):
 		"""Call 'on_error' callback when connection throws an error."""
 		if self.on_error:
-			self.on_error(error, self)
+			self.on_error(self, code, reason)
 
-		self.socket.close()
+		self.close()
 
-	def _on_message(self, ws, message):
+	def _on_message(self, ws, payload, is_binary):
 		"""Call 'on_message' callback when text message is received."""
 		if self.on_message:
-			self.on_message(message, self)
+			self.on_message(self, payload, is_binary)
+
+		if self.on_tick:
+			# If the message is binary, parse it and send it to the callback.
+			if is_binary and len(payload) > 4:
+				self.on_tick(self._parse_binary(payload), self)
+
+	def _on_open(self, ws):
+		if self.on_open:
+			return self.on_open(self)
 
 	def _parse_binary(self, bin):
 		"""Parse binary data to a (list of) ticks structure."""

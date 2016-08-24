@@ -27,5 +27,5 @@ setup(
 		"Topic :: Software Development :: Libraries :: Python Modules",
 		"Topic :: Software Development :: Libraries"
 	],
-	install_requires=["requests", "six", "websocket-client"]
+	install_requires=["requests", "six", "autobahn", "twisted", "pyopenssl", "service_identity"]
 )
